@@ -1,4 +1,11 @@
+# main.py
+
 from gui import run_app
 
-if __name__ == "__main__":
+def main():
     run_app()
+
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+    main()

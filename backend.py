@@ -1,16 +1,14 @@
 # backend.py
 
 import json
-import math
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Optional
+
 import cv2
 from deepface import DeepFace
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-DEFAULT_EMOTIONS = (
-    "angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"
-)
+DEFAULT_EMOTIONS = ("angry", "disgust", "fear", "happy", "sad", "surprise", "neutral")
 
 
 def _analyze_chunk(
@@ -20,7 +18,7 @@ def _analyze_chunk(
     actions: Tuple[str, ...],
     enforce_detection: bool,
     worker_id: int
-) -> Tuple[List[Tuple[int, Tuple[str, str]]], Dict[str, float], int]:
+) -> Tuple[List[Tuple[int, Tuple[str, str]]], dict, int]:
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start)
 
@@ -28,12 +26,13 @@ def _analyze_chunk(
     local_top2: List[Tuple[int, Tuple[str, str]]] = []
     processed = 0
 
-    for frame_idx in range(start, end):
+    while processed < (end - start):
         ret, frame = cap.read()
         if not ret:
             break
-
+        idx = start + processed
         processed += 1
+
         try:
             res = DeepFace.analyze(
                 img_path=frame,
@@ -44,10 +43,9 @@ def _analyze_chunk(
                 res = res[0]
             emotions = res.get("emotion", {})
         except Exception:
-            # при ошибке — нулевые вероятности
             emotions = {}
 
-        # гарантируем наличие всех ключей
+        # гарантируем все базовые ключи
         for emo in DEFAULT_EMOTIONS:
             emotions.setdefault(emo, 0.0)
 
@@ -55,76 +53,65 @@ def _analyze_chunk(
         for emo, p in emotions.items():
             local_sums[emo] += float(p)
 
-        # выбираем топ-2
-        sorted_by_prob = sorted(
+        # топ-2
+        sorted_probs = sorted(
             DEFAULT_EMOTIONS,
             key=lambda e: emotions[e],
             reverse=True
         )
-        local_top2.append((frame_idx, (sorted_by_prob[0], sorted_by_prob[1])))
+        local_top2.append((idx, (sorted_probs[0], sorted_probs[1])))
 
     cap.release()
     return local_top2, local_sums, processed
-
 
 def process_video_parallel(
     video_path: Path,
     actions: Tuple[str, ...] = ("emotion",),
     enforce_detection: bool = False,
     workers: int = None
-) -> Tuple[Dict[str, float], List[Tuple[str, str]]]:
+) -> Tuple[int, dict, List[Tuple[str, str]]]:
     """
     Параллельно анализирует видео:
-      - возвращает распределение эмоций (по средним «сырым» вероятностям)
-      - и карту top-2 эмоций по каждому кадру
+      - возвращает fps,
+      - распределение эмоций (по средним «сырым» вероятностям),
+      - карту top-2 эмоций по каждому кадру.
     """
-    video_str = str(video_path)
-    cap = cv2.VideoCapture(video_str)
+    vid = str(video_path)
+    cap = cv2.VideoCapture(vid)
     if not cap.isOpened():
-        raise FileNotFoundError(video_path)
-    fps = math.floor(cap.get(cv2.CAP_PROP_FPS))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        raise FileNotFoundError(vid)
+
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
     if workers is None:
         from multiprocessing import cpu_count
         workers = cpu_count()
 
-    chunk_size = (total_frames + workers - 1) // workers
-    ranges = [
-        (i, min(i + chunk_size, total_frames))
-        for i in range(0, total_frames, chunk_size)
-    ]
+    chunk = (total + workers - 1) // workers
+    ranges = [(i, min(i + chunk, total)) for i in range(0, total, chunk)]
 
-    emotion_map: List[Tuple[str, str]] = [("", "")] * total_frames
+    emotion_map: List[Tuple[str, str]] = [("", "")] * total
     global_sums = {emo: 0.0 for emo in DEFAULT_EMOTIONS}
-    frames_counted = 0
+    processed = 0
 
     with ProcessPoolExecutor(max_workers=workers) as exe:
         futures = [
-            exe.submit(
-                _analyze_chunk,
-                video_str, start, end,
-                actions, enforce_detection, wid
-            )
+            exe.submit(_analyze_chunk, vid, start, end, actions, enforce_detection, wid)
             for wid, (start, end) in enumerate(ranges)
         ]
         for fut in as_completed(futures):
-            local_top2, local_sums, processed = fut.result()
-            # заполняем карту и складываем суммы
+            local_top2, local_sums, got = fut.result()
             for idx, (d, i) in local_top2:
                 emotion_map[idx] = (d, i)
             for emo, s in local_sums.items():
                 global_sums[emo] += s
-            frames_counted += processed
+            processed += got
 
-    denom = frames_counted or total_frames
-    emotion_percentages = {
-        emo: prob_sum / denom
-        for emo, prob_sum in global_sums.items()
-    }
-
-    return fps, emotion_percentages, emotion_map
+    denom = processed or total
+    percentages = {emo: s / denom for emo, s in global_sums.items()}
+    return fps, percentages, emotion_map
 
 
 def save_emotion_map(
@@ -133,8 +120,7 @@ def save_emotion_map(
     fps: int
 ) -> None:
     """
-    Сохраняет emotion_map в файл JSON.
-    Формат: [ {"dominant": "...", "inferior": "..."}, ... ]
+    Сохраняет в JSON: первым элементом {"fps": fps}, далее топ-2 по кадрам.
     """
     data = [{"fps": fps}] + [
         {"dominant": d, "inferior": i}
@@ -148,41 +134,31 @@ def load_emotion_map(
     filename: Path
 ) -> Tuple[int, List[Tuple[str, str]]]:
     """
-    Загружает JSON-файл и возвращает (fps, emotion_map).
-    Формат JSON:
-      [
-        {"fps": 23},
-        {"dominant": "...", "inferior": "..."},
-        {"dominant": "...", "inferior": "..."},
-        ...
-      ]
+    Читает JSON с первой записью {"fps": ...}, возвращает (fps, [(dom,inferior),...]).
     """
     with open(filename, "r", encoding="utf-8") as fp:
         data = json.load(fp)
 
-    # проверяем, что первый элемент — это fps
     if not data or not isinstance(data[0], dict) or "fps" not in data[0]:
-        raise ValueError("JSON должен начинаться с объекта {\"fps\": <число>}")
+        raise ValueError("JSON должен начинаться с {'fps': <число>}")
 
     fps_val = data[0]["fps"]
     if not isinstance(fps_val, (int, float)):
-        raise ValueError("Значение fps должно быть числом")
+        raise ValueError("fps должен быть числом")
     fps = int(fps_val)
 
-    emotion_map: List[Tuple[str, str]] = []
-    # теперь перебираем все последующие элементы
-    for idx, item in enumerate(data[1:], start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"Элемент {idx}: ожидается словарь")
-        if "dominant" not in item or "inferior" not in item:
-            raise KeyError(f"Элемент {idx}: нет ключей 'dominant' и 'inferior'")
-        d = item["dominant"]
-        i = item["inferior"]
+    emot = []
+    for idx, rec in enumerate(data[1:], start=1):
+        if not isinstance(rec, dict):
+            raise ValueError(f"Элемент {idx}: ожидается объект")
+        if "dominant" not in rec or "inferior" not in rec:
+            raise KeyError(f"Элемент {idx}: пропущены ключи")
+        d, i = rec["dominant"], rec["inferior"]
         if not isinstance(d, str) or not isinstance(i, str):
-            raise ValueError(f"Элемент {idx}: неверные типы, ожидаются строки")
-        emotion_map.append((d, i))
+            raise ValueError(f"Элемент {idx}: доминирующая/второстепенная не строка")
+        emot.append((d, i))
 
-    return fps, emotion_map
+    return fps, emot
 
 
 def compare_emotion_maps(
@@ -193,33 +169,30 @@ def compare_emotion_maps(
     max_shift: int = 50
 ) -> float:
     """
-    Сравнивает две карты эмоций и возвращает % лучшего совпадения.
-    Сдвигами (до max_shift) учитывает отсутствие кадров как несовпадение.
+    Сравнивает две карты эмоций сдвигами (макс. max_shift).
+    Возвращает % лучшего совпадения в диапазоне.
     """
-    slice_ref = ref_map[start_frame:end_frame]
-    slice_test = test_map[start_frame:end_frame]
-    def match_pct(
-        anchor: List[Tuple[str, str]],
-        moving: List[Tuple[str, str]],
-        shift: int
-    ) -> float:
+    a = ref_map[start_frame:end_frame]
+    b = test_map[start_frame:end_frame]
+    total = len(a)
+    if total == 0:
+        return 0.0
+
+    def match_pct(anchor, moving, shift):
         hits = 0
-        total = len(anchor)
-        for i in range(total):
+        for i, (d1, i1) in enumerate(anchor):
             j = i + shift
             if 0 <= j < len(moving):
-                d1, i1 = anchor[i]
                 d2, i2 = moving[j]
                 if d1 == d2 or (d1 == i2 and d2 == i1):
                     hits += 1
         return hits / total * 100.0
 
     best = 0.0
-    # тестовая карта движется относительно эталона
     for s in range(max_shift + 1):
-        best = max(best, match_pct(slice_ref, slice_test, s))
+        best = max(best, match_pct(a, b, s))
     for s in range(1, max_shift + 1):
-        best = max(best, match_pct(slice_test, slice_ref, s))
+        best = max(best, match_pct(b, a, s))
     return best
 
 

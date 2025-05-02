@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QMenu
 )
 from PySide6.QtGui import QPixmap, QImage, QColor, QBrush
-from PySide6.QtCore import Qt, Signal, QTime, QPoint
+from PySide6.QtCore import Qt, Signal, QTime, QPoint, QThread, QObject
 
 from backend import (
     process_video_parallel,
@@ -20,6 +20,26 @@ from backend import (
     compare_emotion_maps
 )
 
+class VideoAnalysisWorker(QObject):
+    started = Signal()
+    finished = Signal(int, dict, list)   # fps, percentages, emotion_map
+    error = Signal(str)
+
+    def __init__(self, video_path, workers=None):
+        super().__init__()
+        self.video_path = video_path
+        self.workers = workers
+
+    def run(self):
+        self.started.emit()
+        try:
+            fps, percentages, emap = process_video_parallel(
+                self.video_path,
+                workers=self.workers
+            )
+            self.finished.emit(fps, percentages, emap)
+        except Exception as e:
+            self.error.emit(str(e))
 
 class VideoPreview(QLabel):
     video_changed = Signal(object)  # emits Path or None
@@ -192,17 +212,28 @@ class MainWindow(QMainWindow):
             self.compare_btn.setEnabled(False)
 
     def on_analyze(self):
-        from PySide6.QtWidgets import QApplication
-        self.log_msg("Старт анализа видео…")
-        QApplication.processEvents()
+        # создаём QThread + worker
+        self.thread = QThread(self)
+        self.worker = VideoAnalysisWorker(self._video_path, workers=None)
+        self.worker.moveToThread(self.thread)
+
+        # сигналы
+        self.worker.started.connect(lambda: self.log_msg("Старт анализа видео…"))
+        self.worker.finished.connect(self._on_analysis_done)
+        self.worker.error.connect(lambda msg: self.log_msg("Ошибка: " + msg))
+        self.thread.started.connect(self.worker.run)
+
+        # блокируем кнопки и запускаем
         self.analyze_btn.setEnabled(False)
+        self.thread.start()
 
-        fps, _, emap = process_video_parallel(self._video_path)
+    def _on_analysis_done(self, fps, emotion_map):
+        # получили результат — запомним
         self._fps = fps
-        self._emotion_map = emap
+        self._emotion_map = emotion_map
 
-        # устанавливаем предел времени из видео
-        duration = len(emap) / fps
+        # обновим таймеры, кнопки, лог
+        duration = len(emotion_map) / fps
         h, rem = divmod(duration, 3600)
         m, s = divmod(rem, 60)
         max_t = QTime(int(h), int(m), int(s))
@@ -213,6 +244,12 @@ class MainWindow(QMainWindow):
         self.download_btn.setEnabled(True)
         self.update_compare_btn()
         self.log_msg("Анализ завершён.")
+
+        # аккуратно останавливаем поток
+        self.thread.quit()
+        self.thread.wait()
+        self.worker = None
+        self.thread = None
 
     def on_download(self):
         path, _ = QFileDialog.getSaveFileName(
