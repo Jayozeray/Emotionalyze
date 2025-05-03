@@ -1,8 +1,9 @@
 # gui.py
 
 import sys
+import time as _pytime
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
@@ -106,6 +107,9 @@ class VideoPreview(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.worker = None
+        self.thread = None
+        self._analysis_start = None
         self.setWindowTitle("Emotionalyze")
         self.resize(1000, 600)
 
@@ -212,6 +216,9 @@ class MainWindow(QMainWindow):
             self.compare_btn.setEnabled(False)
 
     def on_analyze(self):
+
+        # отмечаем момент старта
+        self._analysis_start = _pytime.time()
         # создаём QThread + worker
         self.thread = QThread(self)
         self.worker = VideoAnalysisWorker(self._video_path, workers=None)
@@ -227,7 +234,12 @@ class MainWindow(QMainWindow):
         self.analyze_btn.setEnabled(False)
         self.thread.start()
 
-    def _on_analysis_done(self, fps, emotion_map):
+    def _print_emotion_stats(self, percentages: Dict[str, float]):
+        self.log_msg("Распределение эмоций (%):")
+        for emo, pct in percentages.items():
+            self.log_msg(f"  {emo:8s}: {pct:6.2f}%")
+
+    def _on_analysis_done(self, fps,percentages, emotion_map):
         # получили результат — запомним
         self._fps = fps
         self._emotion_map = emotion_map
@@ -241,9 +253,15 @@ class MainWindow(QMainWindow):
         self.end_time.setMaximumTime(max_t)
         self.end_time.setTime(max_t)
 
+        # Выводим отформатированную таблицу в лог
+        self._print_emotion_stats(percentages)
+
+        # вычисляем реальное время анализа
+        elapsed = _pytime.time() - self._analysis_start
+        self.log_msg(f"Анализ завершён за {elapsed:.2f} сек.")
+
         self.download_btn.setEnabled(True)
         self.update_compare_btn()
-        self.log_msg("Анализ завершён.")
 
         # аккуратно останавливаем поток
         self.thread.quit()
