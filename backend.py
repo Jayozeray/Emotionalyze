@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import cv2
 from deepface import DeepFace
@@ -18,10 +18,9 @@ def _analyze_chunk(
     actions: Tuple[str, ...],
     enforce_detection: bool,
     worker_id: int
-) -> Tuple[List[Tuple[int, Tuple[str, str]]], dict, int]:
+) -> Tuple[List[Tuple[int, Tuple[str, str]]], Dict[str, float], int]:
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-
     local_sums = {emo: 0.0 for emo in DEFAULT_EMOTIONS}
     local_top2: List[Tuple[int, Tuple[str, str]]] = []
     processed = 0
@@ -45,15 +44,12 @@ def _analyze_chunk(
         except Exception:
             emotions = {}
 
-        # гарантируем все базовые ключи
         for emo in DEFAULT_EMOTIONS:
             emotions.setdefault(emo, 0.0)
 
-        # накапливаем вероятности
         for emo, p in emotions.items():
             local_sums[emo] += float(p)
 
-        # топ-2
         sorted_probs = sorted(
             DEFAULT_EMOTIONS,
             key=lambda e: emotions[e],
@@ -64,12 +60,13 @@ def _analyze_chunk(
     cap.release()
     return local_top2, local_sums, processed
 
+
 def process_video_parallel(
     video_path: Path,
     actions: Tuple[str, ...] = ("emotion",),
     enforce_detection: bool = False,
     workers: int = None
-) -> Tuple[int, dict, List[Tuple[str, str]]]:
+) -> Tuple[int, Dict[str, float], List[Tuple[str, str]]]:
     """
     Параллельно анализирует видео:
       - возвращает fps,
@@ -116,13 +113,20 @@ def process_video_parallel(
 
 def save_emotion_map(
     emotion_map: List[Tuple[str, str]],
+    percentages: Dict[str, float],
     filename: Path,
     fps: int
 ) -> None:
     """
-    Сохраняет в JSON: первым элементом {"fps": fps}, далее топ-2 по кадрам.
+    Сохраняет в JSON:
+      1) {"fps": fps}
+      2) {"percentages": {...}}
+      3+) топ-2 по каждому кадру.
     """
-    data = [{"fps": fps}] + [
+    data = [
+        {"fps": fps},
+        {"percentages": percentages},
+    ] + [
         {"dominant": d, "inferior": i}
         for d, i in emotion_map
     ]
@@ -132,33 +136,39 @@ def save_emotion_map(
 
 def load_emotion_map(
     filename: Path
-) -> Tuple[int, List[Tuple[str, str]]]:
+) -> Tuple[int, Dict[str, float], List[Tuple[str, str]]]:
     """
-    Читает JSON с первой записью {"fps": ...}, возвращает (fps, [(dom,inferior),...]).
+    Читает JSON:
+      [ {"fps":…}, {"percentages":…}, {"dominant":…, "inferior":…}, ... ]
+    Возвращает (fps, percentages, [(dom,inferior),...]).
     """
     with open(filename, "r", encoding="utf-8") as fp:
         data = json.load(fp)
 
-    if not data or not isinstance(data[0], dict) or "fps" not in data[0]:
-        raise ValueError("JSON должен начинаться с {'fps': <число>}")
+    if len(data) < 3 or "fps" not in data[0] or "percentages" not in data[1]:
+        raise ValueError("Неверный формат JSON: ожидается fps, percentages, затем кадры")
 
     fps_val = data[0]["fps"]
     if not isinstance(fps_val, (int, float)):
         raise ValueError("fps должен быть числом")
     fps = int(fps_val)
 
-    emot = []
-    for idx, rec in enumerate(data[1:], start=1):
+    percentages = data[1]["percentages"]
+    if not isinstance(percentages, dict):
+        raise ValueError("percentages должен быть объектом")
+
+    emot_list: List[Tuple[str, str]] = []
+    for idx, rec in enumerate(data[2:], start=2):
         if not isinstance(rec, dict):
             raise ValueError(f"Элемент {idx}: ожидается объект")
         if "dominant" not in rec or "inferior" not in rec:
-            raise KeyError(f"Элемент {idx}: пропущены ключи")
+            raise KeyError(f"Элемент {idx}: пропущены ключи dominant/inferior")
         d, i = rec["dominant"], rec["inferior"]
         if not isinstance(d, str) or not isinstance(i, str):
-            raise ValueError(f"Элемент {idx}: доминирующая/второстепенная не строка")
-        emot.append((d, i))
+            raise ValueError(f"Элемент {idx}: доминирующая/второстепенная не строки")
+        emot_list.append((d, i))
 
-    return fps, emot
+    return fps, percentages, emot_list
 
 
 def compare_emotion_maps(
