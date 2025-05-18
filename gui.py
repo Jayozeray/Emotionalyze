@@ -280,7 +280,7 @@ class MainWindow(QMainWindow):
             "JSON (*.json)"
         )
         if save_path:
-            save_emotion_map(self._emotion_map, Path(save_path), self._fps)
+            save_emotion_map(self._emotion_map, self._last_percentages, Path(save_path), self._fps)
             self.log_msg(f"Карта сохранена: {Path(save_path).name}")
         else:
             self.log_msg("Сохранение отменено.")
