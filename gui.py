@@ -1,7 +1,12 @@
 # gui.py
 
+import csv
+import math
 import sys
 import time as _pytime
+from dataclasses import dataclass
+from datetime import datetime
+from itertools import combinations
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
@@ -9,7 +14,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QListWidget, QTextEdit, QFileDialog, QListWidgetItem,
     QHBoxLayout, QVBoxLayout, QGroupBox, QSizePolicy, QTimeEdit,
-    QMenu
+    QMenu, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QGridLayout
 )
 from PySide6.QtGui import QPixmap, QImage, QColor, QBrush
 from PySide6.QtCore import Qt, Signal, QTime, QPoint, QThread, QObject
@@ -17,14 +22,29 @@ from PySide6.QtCore import Qt, Signal, QTime, QPoint, QThread, QObject
 from backend import (
     process_video_parallel,
     save_emotion_map,
-    load_emotion_map,
-    compare_emotion_maps
+    load_emotion_map_ext,
 )
+from comparison import (
+    METHODS, METHOD_TITLES, METHOD_COMBINED, RECOMMENDED_WEIGHTS,
+    RECOMMENDED_SHIFT_SECONDS, RECOMMENDED_SKIP_NEUTRAL,
+    CompareParams, prepare_map, compare_prepared, format_value, verdict
+)
+
+ALL_METHODS_KEY = "all"
+
+
+@dataclass
+class LoadedMap:
+    name: str
+    labels: List[Tuple[str, str]]
+    fps: int
+    item: QListWidgetItem
+    probs: Optional[List[List[float]]] = None
 
 
 class VideoAnalysisWorker(QObject):
     started = Signal()
-    finished = Signal(int, dict, list)  # fps, percentages, emotion_map
+    finished = Signal(int, dict, list, object)  # fps, percentages, emotion_map, probs
     error = Signal(str)
 
     def __init__(self, video_path, workers=None):
@@ -35,11 +55,11 @@ class VideoAnalysisWorker(QObject):
     def run(self):
         self.started.emit()
         try:
-            fps, percentages, emap = process_video_parallel(
+            fps, percentages, emap, probs = process_video_parallel(
                 self.video_path,
                 workers=self.workers
             )
-            self.finished.emit(fps, percentages, emap)
+            self.finished.emit(fps, percentages, emap, probs)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -113,16 +133,18 @@ class MainWindow(QMainWindow):
         self.thread = None
         self._analysis_start = None
         self.setWindowTitle("Emotionalyze")
-        self.resize(1000, 600)
+        self.resize(1100, 700)
 
         # Состояние
         self._video_path: Optional[Path] = None
         self._emotion_map: Optional[List[Tuple[str, str]]] = None
+        self._emotion_probs: Optional[List[List[float]]] = None
         self._last_percentages: Dict[str, float] = {}
         self._fps: int = 0
-        # загруженные карты: (name, map, fps, item)
-        self._loaded_maps: List[Tuple[str, List[Tuple[str, str]], int, QListWidgetItem]] = []
+        self._loaded_maps: List[LoadedMap] = []
         self._test_map_index: Optional[int] = None
+        # строки результатов сравнения для выгрузки в CSV
+        self._results: List[Dict[str, str]] = []
 
         # --- Виджет предпросмотра видео ---
         video_box = QGroupBox("Предпросмотр видео")
@@ -156,6 +178,67 @@ class MainWindow(QMainWindow):
         self.download_btn.setEnabled(False)
         self.download_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+        # --- Параметры сравнения ---
+        params_box = QGroupBox("Параметры сравнения")
+        grid = QGridLayout(params_box)
+        grid.setContentsMargins(6, 6, 6, 6)
+
+        grid.addWidget(QLabel("Метод сравнения:"), 0, 0)
+        self.method_combo = QComboBox()
+        for key in METHODS:
+            self.method_combo.addItem(METHOD_TITLES[key], key)
+        self.method_combo.addItem("Все методы", ALL_METHODS_KEY)
+        self.method_combo.setCurrentIndex(METHODS.index(METHOD_COMBINED))
+        grid.addWidget(self.method_combo, 0, 1, 1, 3)
+
+        grid.addWidget(QLabel("Макс. сдвиг, с:"), 1, 0)
+        self.shift_spin = QDoubleSpinBox()
+        self.shift_spin.setRange(0.0, 30.0)
+        self.shift_spin.setSingleStep(0.1)
+        self.shift_spin.setDecimals(2)
+        self.shift_spin.setValue(RECOMMENDED_SHIFT_SECONDS)
+        self.shift_spin.setToolTip("Пересчитывается в кадры по частоте кадров тестируемой карты")
+        grid.addWidget(self.shift_spin, 1, 1)
+
+        grid.addWidget(QLabel("Окно сглаживания, кадров:"), 1, 2)
+        self.smooth_spin = QSpinBox()
+        self.smooth_spin.setRange(0, 301)
+        self.smooth_spin.setValue(0)
+        self.smooth_spin.setToolTip("0 - без сглаживания")
+        grid.addWidget(self.smooth_spin, 1, 3)
+
+        grid.addWidget(QLabel("Вес уступающей эмоции α:"), 2, 0)
+        self.alpha_spin = QDoubleSpinBox()
+        self.alpha_spin.setRange(0.0, 1.0)
+        self.alpha_spin.setSingleStep(0.05)
+        self.alpha_spin.setValue(0.5)
+        grid.addWidget(self.alpha_spin, 2, 1)
+
+        self.probs_check = QCheckBox("Полные векторы вероятностей")
+        self.probs_check.setChecked(True)
+        self.probs_check.setToolTip("Используются, если они сохранены в карте; "
+                                    "иначе вектор строится по доминантной и уступающей эмоции")
+        grid.addWidget(self.probs_check, 2, 2, 1, 2)
+
+        self.neutral_check = QCheckBox("Исключать безэмоциональные фрагменты (нейтральная – нейтральная)")
+        self.neutral_check.setChecked(RECOMMENDED_SKIP_NEUTRAL)
+        grid.addWidget(self.neutral_check, 3, 0, 1, 4)
+
+        grid.addWidget(QLabel("Веса комб. оценки:"), 4, 0)
+        w_row = QHBoxLayout()
+        self.weight_spins: List[QDoubleSpinBox] = []
+        for caption, val in zip(("баз.", "вект.", "DTW", "част."), RECOMMENDED_WEIGHTS):
+            w_row.addWidget(QLabel(caption))
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1.0)
+            sp.setSingleStep(0.05)
+            sp.setValue(val)
+            sp.setFixedWidth(60)
+            self.weight_spins.append(sp)
+            w_row.addWidget(sp)
+        w_row.addStretch()
+        grid.addLayout(w_row, 4, 1, 1, 3)
+
         # --- Выбор времени и кнопка сравнения ---
         t_row = QHBoxLayout()
         t_row.setContentsMargins(0, 0, 0, 0)
@@ -176,11 +259,26 @@ class MainWindow(QMainWindow):
         self.compare_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         t_row.addWidget(self.compare_btn)
 
+        # --- Межэталонное сравнение и выгрузка результатов ---
+        r_row = QHBoxLayout()
+        self.inter_btn = QPushButton("Межэталонное сравнение")
+        self.inter_btn.setEnabled(False)
+        self.inter_btn.setToolTip("Среднее сходство эталонных карт между собой "
+                                  "(критерий оценки тестируемой карты)")
+        self.export_btn = QPushButton("Сохранить результаты (CSV)")
+        self.export_btn.setEnabled(False)
+        self.clear_results_btn = QPushButton("Очистить результаты")
+        r_row.addWidget(self.inter_btn)
+        r_row.addWidget(self.export_btn)
+        r_row.addWidget(self.clear_results_btn)
+
         # --- Компоновка интерфейса ---
         right = QVBoxLayout()
         right.addWidget(self.log, 1)
         right.addWidget(self.download_btn)
+        right.addWidget(params_box)
         right.addLayout(t_row)
+        right.addLayout(r_row)
 
         main = QHBoxLayout()
         left = QVBoxLayout()
@@ -200,9 +298,18 @@ class MainWindow(QMainWindow):
         self.load_maps_btn.clicked.connect(self.on_load_maps)
         self.clear_maps_btn.clicked.connect(self.on_clear_maps)
         self.compare_btn.clicked.connect(self.on_compare)
+        self.inter_btn.clicked.connect(self.on_inter_reference)
+        self.export_btn.clicked.connect(self.on_export_results)
+        self.clear_results_btn.clicked.connect(self.on_clear_results)
+        self.method_combo.currentIndexChanged.connect(self.update_weight_controls)
+        self.update_weight_controls()
 
     def log_msg(self, text: str):
         self.log.append(text)
+
+    # ------------------------------------------------------------------
+    # Видео
+    # ------------------------------------------------------------------
 
     def on_video_changed(self, path: Optional[Path]):
         self._video_path = path
@@ -213,6 +320,7 @@ class MainWindow(QMainWindow):
         if ok:
             self.download_btn.setEnabled(False)
             self._emotion_map = None
+            self._emotion_probs = None
             self.log_msg(f"Видео загружено: {path.name}")
         else:
             self.log_msg("Видео удалено")
@@ -229,31 +337,43 @@ class MainWindow(QMainWindow):
         # сигналы
         self.worker.started.connect(lambda: self.log_msg("Старт анализа видео…"))
         self.worker.finished.connect(self._on_analysis_done)
-        self.worker.error.connect(lambda msg: self.log_msg("Ошибка: " + msg))
+        self.worker.error.connect(self._on_analysis_error)
         self.thread.started.connect(self.worker.run)
 
         self.analyze_btn.setEnabled(False)
         self.thread.start()
+
+    def _on_analysis_error(self, msg: str):
+        self.log_msg("Ошибка: " + msg)
+        if self.thread is not None:
+            self.thread.quit()
+            self.thread.wait()
+        self.worker = None
+        self.thread = None
+        self.analyze_btn.setEnabled(self._video_path is not None)
 
     def _print_emotion_stats(self, percentages: Dict[str, float]):
         self.log_msg("Распределение эмоций (%):")
         for emo, pct in percentages.items():
             self.log_msg(f"  {emo:8s}: {pct:6.2f}%")
 
-    def _on_analysis_done(self, fps, percentages, emotion_map):
-        # сохраним результат
-        self._fps = fps
-        self._emotion_map = emotion_map
-        self._last_percentages = percentages
-
-        # таймеры
-        duration = len(emotion_map) / fps
+    def _set_time_limits(self, frames: int, fps: int):
+        duration = frames / fps if fps else 0
         h, rem = divmod(duration, 3600)
         m, s = divmod(rem, 60)
         max_t = QTime(int(h), int(m), int(s))
         self.start_time.setMaximumTime(max_t)
         self.end_time.setMaximumTime(max_t)
         self.end_time.setTime(max_t)
+
+    def _on_analysis_done(self, fps, percentages, emotion_map, probs):
+        # сохраним результат
+        self._fps = fps
+        self._emotion_map = emotion_map
+        self._emotion_probs = probs
+        self._last_percentages = percentages
+
+        self._set_time_limits(len(emotion_map), fps)
 
         # лог
         self._print_emotion_stats(percentages)
@@ -268,6 +388,7 @@ class MainWindow(QMainWindow):
         self.thread.wait()
         self.worker = None
         self.thread = None
+        self.analyze_btn.setEnabled(True)
 
     def on_download(self):
         # формируем имя по шаблону EM_<stem>.json
@@ -280,12 +401,18 @@ class MainWindow(QMainWindow):
             "JSON (*.json)"
         )
         if save_path:
-            save_emotion_map(self._emotion_map, self._last_percentages, Path(save_path), self._fps)
+            save_emotion_map(self._emotion_map, self._last_percentages, Path(save_path),
+                             self._fps, self._emotion_probs)
             self.log_msg(f"Карта сохранена: {Path(save_path).name}")
         else:
             self.log_msg("Сохранение отменено.")
 
-    def _add_loaded_map(self, name: str, m: List[Tuple[str, str]], fps: int):
+    # ------------------------------------------------------------------
+    # Загруженные карты
+    # ------------------------------------------------------------------
+
+    def _add_loaded_map(self, name: str, m: List[Tuple[str, str]], fps: int,
+                        probs: Optional[List[List[float]]] = None):
         item = QListWidgetItem()
         w = QWidget()
         lay = QHBoxLayout(w)
@@ -300,20 +427,24 @@ class MainWindow(QMainWindow):
         self.maps_list.addItem(item)
         self.maps_list.setItemWidget(item, w)
         btn.clicked.connect(lambda _, it=item: self._remove_map(it))
-        self._loaded_maps.append((name, m, fps, item))
-        self.log_msg(f"Загружена карта: {name}")
+        self._loaded_maps.append(LoadedMap(name, m, fps, item, probs))
+        kind = "с полными векторами вероятностей" if probs is not None else "доминантная и уступающая эмоции"
+        self.log_msg(f"Загружена карта: {name} ({kind})")
         self.update_compare_btn()
 
     def _remove_map(self, item: QListWidgetItem):
-        for idx, (nm, m, fps, it) in enumerate(self._loaded_maps):
-            if it is item:
+        for idx, lm in enumerate(self._loaded_maps):
+            if lm.item is item:
                 self._loaded_maps.pop(idx)
                 if self._test_map_index == idx:
                     self._test_map_index = None
+                elif self._test_map_index is not None and self._test_map_index > idx:
+                    self._test_map_index -= 1
                 self.maps_list.takeItem(self.maps_list.row(item))
-                self.log_msg(f"Карта удалена: {nm}")
+                self.log_msg(f"Карта удалена: {lm.name}")
                 break
         self.clear_test_highlight()
+        self.highlight_test_map()
         self.update_compare_btn()
 
     def on_load_maps(self):
@@ -322,9 +453,8 @@ class MainWindow(QMainWindow):
         )
         for f in files:
             try:
-                # теперь load_emotion_map возвращает 3 значения
-                fps, percentages, m = load_emotion_map(Path(f))
-                self._add_loaded_map(Path(f).name, m, fps)
+                fps, percentages, m, probs = load_emotion_map_ext(Path(f))
+                self._add_loaded_map(Path(f).name, m, fps, probs)
             except Exception as e:
                 self.log_msg(f"Ошибка загрузки {Path(f).name}: {e}")
         self.update_compare_btn()
@@ -348,75 +478,219 @@ class MainWindow(QMainWindow):
         menu.exec(self.maps_list.viewport().mapToGlobal(pos))
 
     def set_test_map(self, item: QListWidgetItem):
-        for idx, (_n, _m, fps, it) in enumerate(self._loaded_maps):
-            if it is item:
+        for idx, lm in enumerate(self._loaded_maps):
+            if lm.item is item:
                 self._test_map_index = idx
                 break
         self.clear_test_highlight()
-        w = self.maps_list.itemWidget(item)
-        w.setStyleSheet("background-color: rgba(0,120,215,100);")
-        name, m, fps, _ = self._loaded_maps[self._test_map_index]
-        self.log_msg(f"Тестируемая карта: {name}")
-        duration = len(m) / fps
-        h, rem = divmod(duration, 3600)
-        m2, s = divmod(rem, 60)
-        max_t = QTime(int(h), int(m2), int(s))
-        self.start_time.setMaximumTime(max_t)
-        self.end_time.setMaximumTime(max_t)
-        self.end_time.setTime(max_t)
+        self.highlight_test_map()
+        lm = self._loaded_maps[self._test_map_index]
+        self.log_msg(f"Тестируемая карта: {lm.name}")
+        self._set_time_limits(len(lm.labels), lm.fps)
         self.update_compare_btn()
 
+    def highlight_test_map(self):
+        if self._test_map_index is None:
+            return
+        w = self.maps_list.itemWidget(self._loaded_maps[self._test_map_index].item)
+        if w is not None:
+            w.setStyleSheet("background-color: rgba(0,120,215,100);")
+
     def clear_test_highlight(self):
-        for _n, _m, _fps, it in self._loaded_maps:
-            w = self.maps_list.itemWidget(it)
-            w.setStyleSheet("")
+        for lm in self._loaded_maps:
+            w = self.maps_list.itemWidget(lm.item)
+            if w is not None:
+                w.setStyleSheet("")
+
+    # ------------------------------------------------------------------
+    # Сравнение
+    # ------------------------------------------------------------------
+
+    def update_weight_controls(self, *_):
+        key = self.method_combo.currentData()
+        enabled = key in (METHOD_COMBINED, ALL_METHODS_KEY)
+        for sp in self.weight_spins:
+            sp.setEnabled(enabled)
+
+    def current_params(self, fps: int = 30) -> CompareParams:
+        return CompareParams(
+            max_shift=int(round(self.shift_spin.value() * fps)),
+            alpha=self.alpha_spin.value(),
+            smooth_window=self.smooth_spin.value(),
+            skip_neutral=self.neutral_check.isChecked(),
+            use_probs=self.probs_check.isChecked(),
+            weights=tuple(sp.value() for sp in self.weight_spins),
+        )
+
+    def _effective_params(self, probs_list, fps: int) -> CompareParams:
+        """Полные векторы используются, только если они есть во всех сравниваемых картах."""
+        params = self.current_params(fps)
+        if params.use_probs and any(p is None for p in probs_list):
+            params.use_probs = False
+            self.log_msg("Не во всех картах есть полные векторы вероятностей – "
+                         "используется представление по доминантной и уступающей эмоции.")
+        return params
+
+    def current_methods(self) -> List[str]:
+        key = self.method_combo.currentData()
+        return list(METHODS) if key == ALL_METHODS_KEY else [key]
+
+    def _frame_range(self, fps: int, max_frames: int) -> Optional[Tuple[int, int, int, int]]:
+        t1, t2 = self.start_time.time(), self.end_time.time()
+        sec1 = t1.hour() * 3600 + t1.minute() * 60 + t1.second()
+        sec2 = t2.hour() * 3600 + t2.minute() * 60 + t2.second()
+        if sec2 <= sec1:
+            self.log_msg("Ошибка: 'по' должно быть позже 'с'")
+            return None
+        sf, ef = int(sec1 * fps), int(sec2 * fps)
+        if sf < 0 or ef > max_frames:
+            self.log_msg(f"Диапазон кадров 0–{max_frames}, задан {sf}–{ef}")
+            return None
+        return sf, ef, sec1, sec2
+
+    def _add_result(self, test_name, ref_name, sec1, sec2, sf, ef, method, value, params):
+        self._results.append({
+            "Дата и время": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Тестируемая карта": test_name,
+            "Эталонная карта": ref_name,
+            "Начало, с": str(sec1),
+            "Конец, с": str(sec2),
+            "Начальный кадр": str(sf),
+            "Конечный кадр": str(ef),
+            "Метод": METHOD_TITLES.get(method, method),
+            "Сходство, %": "" if value is None or math.isnan(value) else f"{value:.2f}".replace(".", ","),
+            "Макс. сдвиг": str(params.max_shift),
+            "alpha": f"{params.alpha:.2f}".replace(".", ","),
+            "Окно сглаживания": str(params.smooth_window),
+            "Исключение нейтральных": "да" if params.skip_neutral else "нет",
+            "Полные векторы": "да" if params.use_probs else "нет",
+            "Веса": " / ".join(f"{w:.2f}" for w in params.weights),
+        })
+        self.export_btn.setEnabled(True)
 
     def on_compare(self):
         use_video = (self._test_map_index is None)
         if use_video:
             if not self._emotion_map or not self._loaded_maps:
                 return
+            test_name = self._video_path.name if self._video_path else "результат анализа видео"
+            test_labels, test_probs, fps = self._emotion_map, self._emotion_probs, self._fps
+            refs = list(self._loaded_maps)
         else:
             if len(self._loaded_maps) < 2:
                 return
-        t1, t2 = self.start_time.time(), self.end_time.time()
-        sec1 = t1.hour() * 3600 + t1.minute() * 60 + t1.second()
-        sec2 = t2.hour() * 3600 + t2.minute() * 60 + t2.second()
-        if sec2 <= sec1:
-            return self.log_msg("Ошибка: 'по' должно быть позже 'с'")
-        if use_video:
-            sf, ef = int(sec1 * self._fps), int(sec2 * self._fps)
-            maxf = len(self._emotion_map)
-        else:
-            _, test_map, fps, _ = self._loaded_maps[self._test_map_index]
-            sf, ef = int(sec1 * fps), int(sec2 * fps)
-            maxf = len(test_map)
-        if sf < 0 or ef > maxf:
-            return self.log_msg(f"Диапазон кадров 0–{maxf}, задан {sf}–{ef}")
+            tm = self._loaded_maps[self._test_map_index]
+            test_name, test_labels, test_probs, fps = tm.name, tm.labels, tm.probs, tm.fps
+            refs = [lm for k, lm in enumerate(self._loaded_maps) if k != self._test_map_index]
+
+        rng = self._frame_range(fps, len(test_labels))
+        if rng is None:
+            return
+        sf, ef, sec1, sec2 = rng
+        params = self._effective_params([test_probs] + [r.probs for r in refs], fps)
+        methods = self.current_methods()
+
         self.log_msg(f"Сравнение с кадра {sf} по {ef}…")
-        best_name, best_pct = None, -1.0
-        if use_video:
-            for name, ref_map, _fps, _ in self._loaded_maps:
-                pct = compare_emotion_maps(
-                    self._emotion_map, ref_map,
-                    start_frame=sf, end_frame=ef
-                )
-                self.log_msg(f"{name} → {pct:.2f}%")
-                if pct > best_pct:
-                    best_pct, best_name = pct, name
-        else:
-            _, test_map, _, _ = self._loaded_maps[self._test_map_index]
-            for idx, (name, ref_map, _fps, _) in enumerate(self._loaded_maps):
-                if idx == self._test_map_index:
-                    continue
-                pct = compare_emotion_maps(
-                    ref_map, test_map,
-                    start_frame=sf, end_frame=ef
-                )
-                self.log_msg(f"{name} → {pct:.2f}%")
-                if pct > best_pct:
-                    best_pct, best_name = pct, name
-        self.log_msg(f"Лучшее совпадение: {best_name} — {best_pct:.2f}%")
+        self.log_msg(f"Параметры: {params.describe()}")
+        t0 = _pytime.time()
+        test_prep = prepare_map(test_labels, test_probs, params).slice(sf, ef)
+
+        best: Dict[str, Tuple[Optional[str], float]] = {m: (None, -1.0) for m in methods}
+        scores: Dict[str, List[float]] = {m: [] for m in methods}
+        ref_preps = []
+        for ref in refs:
+            ref_prep = prepare_map(ref.labels, ref.probs, params).slice(sf, ef)
+            ref_preps.append(ref_prep)
+            res = compare_prepared(ref_prep, test_prep, methods, params)
+            for m in methods:
+                scores[m].append(res.get(m, math.nan))
+            if len(methods) == 1:
+                self.log_msg(f"{ref.name} → {format_value(res[methods[0]])}")
+            else:
+                parts = " | ".join(f"{METHOD_TITLES[m]}: {format_value(res[m])}" for m in methods)
+                self.log_msg(f"{ref.name} → {parts}")
+            for m in methods:
+                val = res.get(m, math.nan)
+                self._add_result(test_name, ref.name, sec1, sec2, sf, ef, m, val, params)
+                if not math.isnan(val) and val > best[m][1]:
+                    best[m] = (ref.name, val)
+
+        for m in methods:
+            name, val = best[m]
+            prefix = "Лучшее совпадение" if len(methods) == 1 else f"Лучшее совпадение ({METHOD_TITLES[m]})"
+            if name is None:
+                self.log_msg(f"{prefix}: н/д")
+            else:
+                self.log_msg(f"{prefix}: {name} – {val:.2f}%")
+
+        # вердикт по критерию межэталонного сравнения
+        if len(ref_preps) >= 2:
+            main_method = METHOD_COMBINED if len(methods) > 1 else methods[0]
+            pair_scores = [compare_prepared(a, b, [main_method], params)[main_method]
+                           for a, b in combinations(ref_preps, 2)]
+            mean_test, crit, ok = verdict(scores[main_method], pair_scores)
+            if ok is None:
+                self.log_msg("Вердикт: недостаточно данных")
+            else:
+                self.log_msg(f"Среднее сходство с эталонами ({METHOD_TITLES[main_method]}): "
+                             f"{mean_test:.2f}%, критерий (среднее межэталонное): {crit:.2f}%")
+                if ok:
+                    self.log_msg("Вердикт: реакция соответствует эталонным")
+                else:
+                    self.log_msg("Вердикт: реакция отличается от эталонных, "
+                                 "рекомендуется дополнительный анализ специалистом")
+        self.log_msg(f"Время сравнения: {_pytime.time() - t0:.2f} сек.")
+
+    def on_inter_reference(self):
+        """Среднее сходство эталонных карт между собой (все пары без повторений)."""
+        refs = [lm for k, lm in enumerate(self._loaded_maps) if k != self._test_map_index]
+        if len(refs) < 2:
+            return
+        fps = refs[0].fps
+        rng = self._frame_range(fps, min(len(r.labels) for r in refs))
+        if rng is None:
+            return
+        sf, ef, sec1, sec2 = rng
+        params = self._effective_params([r.probs for r in refs], fps)
+        methods = self.current_methods()
+        prepared = [prepare_map(r.labels, r.probs, params).slice(sf, ef) for r in refs]
+
+        self.log_msg(f"Межэталонное сравнение с кадра {sf} по {ef} ({len(refs)} карт)…")
+        self.log_msg(f"Параметры: {params.describe()}")
+        sums = {m: 0.0 for m in methods}
+        counts = {m: 0 for m in methods}
+        for (i, a), (j, b) in combinations(enumerate(prepared), 2):
+            res = compare_prepared(a, b, methods, params)
+            for m in methods:
+                val = res.get(m, math.nan)
+                self._add_result(refs[j].name, refs[i].name, sec1, sec2, sf, ef, m, val, params)
+                if not math.isnan(val):
+                    sums[m] += val
+                    counts[m] += 1
+        for m in methods:
+            mean = sums[m] / counts[m] if counts[m] else math.nan
+            self.log_msg(f"Среднее совпадение эталонов ({METHOD_TITLES[m]}): {format_value(mean)}")
+
+    def on_export_results(self):
+        if not self._results:
+            return
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить результаты сравнения", "comparison_results.csv", "CSV (*.csv)"
+        )
+        if not save_path:
+            self.log_msg("Сохранение результатов отменено.")
+            return
+        fields = list(self._results[0].keys())
+        with open(save_path, "w", newline="", encoding="utf-8-sig") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fields, delimiter=";")
+            writer.writeheader()
+            writer.writerows(self._results)
+        self.log_msg(f"Результаты сохранены: {Path(save_path).name} ({len(self._results)} строк)")
+
+    def on_clear_results(self):
+        self._results.clear()
+        self.export_btn.setEnabled(False)
+        self.log_msg("Результаты сравнения очищены.")
 
     def update_compare_btn(self):
         if self._test_map_index is not None:
@@ -424,6 +698,8 @@ class MainWindow(QMainWindow):
         else:
             ready = bool(self._emotion_map) and bool(self._loaded_maps)
         self.compare_btn.setEnabled(ready)
+        n_refs = len(self._loaded_maps) - (1 if self._test_map_index is not None else 0)
+        self.inter_btn.setEnabled(n_refs >= 2)
 
 
 def run_app():

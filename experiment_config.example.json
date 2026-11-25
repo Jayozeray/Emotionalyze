@@ -1,0 +1,17 @@
+{
+  "maps_dir": "maps",
+  "test_person": "6",
+  "maps": [
+    {"file": "EM_1_video1.json", "person": "1", "video": "1"},
+    {"file": "EM_1_video2.json", "person": "1", "video": "2"},
+    {"file": "EM_1_video3.json", "person": "1", "video": "3"},
+    {"file": "EM_6_video1.json", "person": "6", "video": "1"}
+  ],
+  "segments": [
+    {"name": "1",   "video": "1", "start": 0,  "end": null},
+    {"name": "2",   "video": "2", "start": 0,  "end": null},
+    {"name": "3.1", "video": "3", "start": 0,  "end": 25},
+    {"name": "3.2", "video": "3", "start": 25, "end": 60},
+    {"name": "3.3", "video": "3", "start": 60, "end": null}
+  ]
+}

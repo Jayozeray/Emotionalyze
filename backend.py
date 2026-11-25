@@ -1,12 +1,14 @@
 # backend.py
 
-import json
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
 import cv2
 from deepface import DeepFace
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from comparison import base_similarity
+from emotion_map_io import save_emotion_map, load_emotion_map_ext, load_emotion_map
 
 DEFAULT_EMOTIONS = ("angry", "disgust", "fear", "happy", "sad", "surprise", "neutral")
 
@@ -18,11 +20,12 @@ def _analyze_chunk(
     actions: Tuple[str, ...],
     enforce_detection: bool,
     worker_id: int
-) -> Tuple[List[Tuple[int, Tuple[str, str]]], Dict[str, float], int]:
+) -> Tuple[List[Tuple[int, Tuple[str, str]]], Dict[str, float], int, List[Tuple[int, List[float]]]]:
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start)
     local_sums = {emo: 0.0 for emo in DEFAULT_EMOTIONS}
     local_top2: List[Tuple[int, Tuple[str, str]]] = []
+    local_probs: List[Tuple[int, List[float]]] = []
     processed = 0
 
     while processed < (end - start):
@@ -56,9 +59,11 @@ def _analyze_chunk(
             reverse=True
         )
         local_top2.append((idx, (sorted_probs[0], sorted_probs[1])))
+        # полный вектор вероятностей (DeepFace возвращает проценты)
+        local_probs.append((idx, [float(emotions[e]) / 100.0 for e in DEFAULT_EMOTIONS]))
 
     cap.release()
-    return local_top2, local_sums, processed
+    return local_top2, local_sums, processed, local_probs
 
 
 def process_video_parallel(
@@ -66,12 +71,13 @@ def process_video_parallel(
     actions: Tuple[str, ...] = ("emotion",),
     enforce_detection: bool = False,
     workers: int = None
-) -> Tuple[int, Dict[str, float], List[Tuple[str, str]]]:
+) -> Tuple[int, Dict[str, float], List[Tuple[str, str]], List[List[float]]]:
     """
     Параллельно анализирует видео:
       - возвращает fps,
       - распределение эмоций (по средним «сырым» вероятностям),
-      - карту top-2 эмоций по каждому кадру.
+      - карту top-2 эмоций по каждому кадру,
+      - полные векторы вероятностей эмоций по каждому кадру.
     """
     vid = str(video_path)
     cap = cv2.VideoCapture(vid)
@@ -90,6 +96,7 @@ def process_video_parallel(
     ranges = [(i, min(i + chunk, total)) for i in range(0, total, chunk)]
 
     emotion_map: List[Tuple[str, str]] = [("", "")] * total
+    probs_map: List[List[float]] = [[0.0] * len(DEFAULT_EMOTIONS) for _ in range(total)]
     global_sums = {emo: 0.0 for emo in DEFAULT_EMOTIONS}
     processed = 0
 
@@ -99,76 +106,25 @@ def process_video_parallel(
             for wid, (start, end) in enumerate(ranges)
         ]
         for fut in as_completed(futures):
-            local_top2, local_sums, got = fut.result()
+            local_top2, local_sums, got, local_probs = fut.result()
             for idx, (d, i) in local_top2:
                 emotion_map[idx] = (d, i)
+            for idx, p in local_probs:
+                probs_map[idx] = p
             for emo, s in local_sums.items():
                 global_sums[emo] += s
             processed += got
 
+    # если OpenCV завысил число кадров, отбрасываем непрочитанный хвост
+    filled = [k for k, (d, _) in enumerate(emotion_map) if d]
+    if filled and filled[-1] + 1 < total:
+        last = filled[-1] + 1
+        emotion_map = emotion_map[:last]
+        probs_map = probs_map[:last]
+
     denom = processed or total
     percentages = {emo: s / denom for emo, s in global_sums.items()}
-    return fps, percentages, emotion_map
-
-
-def save_emotion_map(
-    emotion_map: List[Tuple[str, str]],
-    percentages: Dict[str, float],
-    filename: Path,
-    fps: int
-) -> None:
-    """
-    Сохраняет в JSON:
-      1) {"fps": fps}
-      2) {"percentages": {...}}
-      3+) топ-2 по каждому кадру.
-    """
-    data = [
-        {"fps": fps},
-        {"percentages": percentages},
-    ] + [
-        {"dominant": d, "inferior": i}
-        for d, i in emotion_map
-    ]
-    with open(filename, "w", encoding="utf-8") as fp:
-        json.dump(data, fp, ensure_ascii=False, indent=2)
-
-
-def load_emotion_map(
-    filename: Path
-) -> Tuple[int, Dict[str, float], List[Tuple[str, str]]]:
-    """
-    Читает JSON:
-      [ {"fps":…}, {"percentages":…}, {"dominant":…, "inferior":…}, ... ]
-    Возвращает (fps, percentages, [(dom,inferior),...]).
-    """
-    with open(filename, "r", encoding="utf-8") as fp:
-        data = json.load(fp)
-
-    if len(data) < 3 or "fps" not in data[0] or "percentages" not in data[1]:
-        raise ValueError("Неверный формат JSON: ожидается fps, percentages, затем кадры")
-
-    fps_val = data[0]["fps"]
-    if not isinstance(fps_val, (int, float)):
-        raise ValueError("fps должен быть числом")
-    fps = int(fps_val)
-
-    percentages = data[1]["percentages"]
-    if not isinstance(percentages, dict):
-        raise ValueError("percentages должен быть объектом")
-
-    emot_list: List[Tuple[str, str]] = []
-    for idx, rec in enumerate(data[2:], start=2):
-        if not isinstance(rec, dict):
-            raise ValueError(f"Элемент {idx}: ожидается объект")
-        if "dominant" not in rec or "inferior" not in rec:
-            raise KeyError(f"Элемент {idx}: пропущены ключи dominant/inferior")
-        d, i = rec["dominant"], rec["inferior"]
-        if not isinstance(d, str) or not isinstance(i, str):
-            raise ValueError(f"Элемент {idx}: доминирующая/второстепенная не строки")
-        emot_list.append((d, i))
-
-    return fps, percentages, emot_list
+    return fps, percentages, emotion_map, probs_map
 
 
 def compare_emotion_maps(
@@ -179,36 +135,21 @@ def compare_emotion_maps(
     max_shift: int = 50
 ) -> float:
     """
-    Сравнивает две карты эмоций сдвигами (макс. max_shift).
+    Базовый алгоритм: сравнивает две карты эмоций сдвигами (макс. max_shift).
     Возвращает % лучшего совпадения в диапазоне.
+    Остальные методы сравнения находятся в модуле comparison.
     """
-    a = ref_map[start_frame:end_frame]
-    b = test_map[start_frame:end_frame]
-    total = len(a)
-    if total == 0:
-        return 0.0
-
-    def match_pct(anchor, moving, shift):
-        hits = 0
-        for i, (d1, i1) in enumerate(anchor):
-            j = i + shift
-            if 0 <= j < len(moving):
-                d2, i2 = moving[j]
-                if d1 == d2 or (d1 == i2 and d2 == i1):
-                    hits += 1
-        return hits / total * 100.0
-
-    best = 0.0
-    for s in range(max_shift + 1):
-        best = max(best, match_pct(a, b, s))
-    for s in range(1, max_shift + 1):
-        best = max(best, match_pct(b, a, s))
-    return best
+    return base_similarity(
+        ref_map[start_frame:end_frame],
+        test_map[start_frame:end_frame],
+        max_shift=max_shift
+    )
 
 
 __all__ = [
     "process_video_parallel",
     "save_emotion_map",
     "load_emotion_map",
+    "load_emotion_map_ext",
     "compare_emotion_maps",
 ]
