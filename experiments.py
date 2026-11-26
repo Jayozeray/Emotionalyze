@@ -32,7 +32,9 @@
   e4  устойчивость к безэмоциональным фрагментам (общий нейтральный участок);
   e5  устойчивость к запаздыванию и изменению темпа реакции;
   e6  подбор весов комбинированной оценки;
-  e7  время вычисления.
+  e7  время вычисления;
+  e8  ослабленная и отсутствующая реакция («каменное лицо»): у тестируемого
+      гасится доля эмоциональных кадров, проверяется, отклоняется ли реакция.
 """
 
 import argparse
@@ -163,6 +165,19 @@ def delay(labels, probs, frames: int):
     idx = np.concatenate([np.zeros(frames, dtype=int), np.arange(n - frames)])
     idx = np.clip(idx, 0, n - 1)
     return [labels[i] for i in idx], (None if probs is None else probs[idx])
+
+
+def flatten(labels, probs, share: float, rng: random.Random):
+    """Ослабление реакции: доля share эмоциональных кадров заменяется нейтральными («каменное лицо»)."""
+    lab, vec = neutral_frame(probs is not None)
+    labels = list(labels)
+    probs = None if probs is None else np.array(probs, dtype=float)
+    for k, (d, _) in enumerate(labels):
+        if d != "neutral" and rng.random() < share:
+            labels[k] = lab
+            if probs is not None:
+                probs[k] = vec
+    return labels, probs
 
 
 def stretch(labels, probs, factor: float):
@@ -347,7 +362,7 @@ def main():
     ap = argparse.ArgumentParser(description="Исследование методов сравнения эмоциональных карт")
     ap.add_argument("--config", required=True)
     ap.add_argument("--out", default="results")
-    ap.add_argument("--only", default="e0,e1,e2,e3,e4,e5,e6,e7",
+    ap.add_argument("--only", default="e0,e1,e2,e3,e4,e5,e6,e7,e8",
                     help="список экспериментов через запятую")
     ap.add_argument("--max-shift", type=int, default=50)
     ap.add_argument("--alpha", type=float, default=0.5)
@@ -356,6 +371,7 @@ def main():
     ap.add_argument("--noise", default="0.1,0.2,0.3")
     ap.add_argument("--neutral", default="0.5,1.0", help="длина нейтрального участка в долях отрезка")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--flat", default="0,0.5,0.8,1.0", help="доли погашенных эмоциональных кадров для e8")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--weights", default=None, help="веса комбинированной оценки через запятую")
@@ -543,6 +559,7 @@ def main():
         t0 = time.time()
         res = run_tasks(tasks, args.workers)
         print(f"  готово за {time.time() - t0:.1f} с")
+        (out / "e3_raw.pkl").write_bytes(pickle.dumps([(k, vals) for k, vals, _t in res]))
         rows = []
         for v in variants:
             for lvl in [0.0] + levels:
@@ -587,6 +604,7 @@ def main():
         t0 = time.time()
         res = run_tasks(tasks, args.workers)
         print(f"  готово за {time.time() - t0:.1f} с")
+        (out / "e4_raw.pkl").write_bytes(pickle.dumps([(k, vals) for k, vals, _t in res]))
         rows = []
         for v in variants:
             clean = {}
@@ -626,6 +644,7 @@ def main():
         t0 = time.time()
         res = run_tasks(tasks, args.workers)
         print(f"  готово за {time.time() - t0:.1f} с")
+        (out / "e5_raw.pkl").write_bytes(pickle.dumps([(k, vals) for k, vals, _t in res]))
         agg = {}
         for key, vals, _t in res:
             full = with_combined(vals)
@@ -635,6 +654,55 @@ def main():
                  "Метод": METHOD_TITLES[m], "Сходство с исходной картой, %": nanmean(xs)}
                 for (v, kind, val, m), xs in sorted(agg.items(), key=lambda t: (t[0][0], t[0][1], t[0][2], t[0][3]))]
         write_csv(out / "e5_distortion.csv", rows)
+
+    # --- e8: ослабленная и отсутствующая реакция («каменное лицо») ---
+    if "e8" in only:
+        shares = [float(x) for x in args.flat.split(",") if x]
+        tasks = []
+        for g in ds.segments:
+            persons = ds.persons_for(g)
+            for p in persons:
+                refs = [q for q in persons if q != p]
+                for sh in shares:
+                    for rep in range(args.reps if 0 < sh < 1 else 1):
+                        fl = flatten(*ds.segment(p, g), sh, rng)
+                        for v in variants:
+                            for q in refs:
+                                tasks.append(((v, sh, rep, g["name"], p, q), ds.segment(q, g), fl, vparams[v]))
+                for v in variants:
+                    for q, r in combinations(refs, 2):
+                        tasks.append(((v, "crit", 0, g["name"], p, (q, r)), ds.segment(q, g), ds.segment(r, g), vparams[v]))
+        print(f"e8: сравнений {len(tasks)}")
+        t0 = time.time()
+        res = run_tasks(tasks, args.workers)
+        print(f"  готово за {time.time() - t0:.1f} с")
+        (out / "e8_raw.pkl").write_bytes(pickle.dumps([(k, vals) for k, vals, _t in res]))
+        crit, score = {}, {}
+        for key, vals, _t in res:
+            v, sh, rep, g, p, q = key
+            full = with_combined(vals)
+            if sh == "crit":
+                for m in METHODS:
+                    crit.setdefault((v, g, p, m), []).append(full[m])
+            else:
+                for m in METHODS:
+                    score.setdefault((v, sh, rep, g, p, m), []).append(full[m])
+        rows = []
+        for v in variants:
+            for sh in shares:
+                for m in METHODS:
+                    means, rej = [], []
+                    for (vv, s2, rep, g, p, mm), xs in score.items():
+                        if vv != v or s2 != sh or mm != m:
+                            continue
+                        mt = nanmean(xs)
+                        c = nanmean(crit[(v, g, p, m)])
+                        means.append(mt)
+                        rej.append(1.0 if (math.isnan(mt) or mt < c) else 0.0)
+                    rows.append({"Вариант": VARIANT_TITLES[v], "Метод": METHOD_TITLES[m], "Доля погашенных эмоций": sh,
+                                 "Среднее сходство с эталонами, %": nanmean(means),
+                                 "Доля отклонённых реакций": nanmean(rej)})
+        write_csv(out / "e8_flat.csv", rows)
 
     print(f"Результаты сохранены в {out.resolve()}")
 

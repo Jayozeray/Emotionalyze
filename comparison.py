@@ -49,10 +49,11 @@ METHOD_TITLES = {
 
 DEFAULT_WEIGHTS = (0.25, 0.35, 0.30, 0.10)       # экспертные веса из отчёта за 2 семестр
 
-# Рекомендуемая по результатам экспериментов конфигурация:
-# комбинированная оценка из динамического выравнивания и частотного распределения
+# Предварительно рекомендуемая конфигурация (по картам без полных векторов вероятностей):
+# комбинированная оценка из динамического выравнивания (0,7) и векторного метода (0,3)
 # с исключением безэмоциональных фрагментов, максимальный сдвиг 2 с, без сглаживания.
-RECOMMENDED_WEIGHTS = (0.0, 0.0, 0.5, 0.5)
+# Будет уточнена на картах с полными векторами вероятностей.
+RECOMMENDED_WEIGHTS = (0.0, 0.3, 0.7, 0.0)
 RECOMMENDED_SHIFT_SECONDS = 2.0
 RECOMMENDED_SKIP_NEUTRAL = True
 
@@ -359,22 +360,45 @@ def dtw_similarity(a: PreparedMap, b: PreparedMap, window: int = 50,
 # Частотное распределение эмоций
 # ---------------------------------------------------------------------------
 
-def emotion_frequencies(labels: Labels, skip_neutral: bool = False) -> np.ndarray:
-    """Доли кадров с каждой доминантной эмоцией."""
+def emotion_frequencies(labels: Labels, keep: Optional[np.ndarray] = None) -> np.ndarray:
+    """Доли кадров с каждой доминантной эмоцией (keep - маска учитываемых кадров)."""
     f = np.zeros(len(EMOTIONS), dtype=float)
-    for d, _ in labels:
+    for k, (d, _) in enumerate(labels):
+        if keep is not None and not keep[k]:
+            continue
         if d in EMO_INDEX:
             f[EMO_INDEX[d]] += 1.0
-    if skip_neutral:
-        f[NEUTRAL_IDX] = 0.0
     s = f.sum()
     return f / s if s > 0 else f
 
 
+def _joint_keep(a: Labels, b: Labels) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Маски кадров для исключения безэмоциональных фрагментов: кадр отбрасывается,
+    только если в этот же момент нейтральная эмоция доминирует в обеих картах.
+    Нейтральные кадры одной карты при эмоциональной реакции другой сохраняются,
+    поэтому «каменное лицо» на фоне выраженной реакции эталона остаётся различием.
+    """
+    na = np.array([d == NEUTRAL for d, _ in a], dtype=bool)
+    nb = np.array([d == NEUTRAL for d, _ in b], dtype=bool)
+    m = min(len(a), len(b))
+    both = na[:m] & nb[:m]
+    ka = np.ones(len(a), dtype=bool)
+    kb = np.ones(len(b), dtype=bool)
+    ka[:m] = ~both
+    kb[:m] = ~both
+    return ka, kb
+
+
 def freq_similarity(a: Labels, b: Labels, skip_neutral: bool = False) -> float:
     """P_freq = 100 * sum_k min(f_k^R, f_k^T) - пересечение гистограмм."""
-    fa = emotion_frequencies(a, skip_neutral)
-    fb = emotion_frequencies(b, skip_neutral)
+    if skip_neutral:
+        ka, kb = _joint_keep(a, b)
+        fa = emotion_frequencies(a, ka)
+        fb = emotion_frequencies(b, kb)
+    else:
+        fa = emotion_frequencies(a)
+        fb = emotion_frequencies(b)
     if fa.sum() == 0 or fb.sum() == 0:
         return math.nan
     return 100.0 * float(np.minimum(fa, fb).sum())

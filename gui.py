@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QMenu, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QGridLayout
 )
 from PySide6.QtGui import QPixmap, QImage, QColor, QBrush
-from PySide6.QtCore import Qt, Signal, QTime, QPoint, QThread, QObject
+from PySide6.QtCore import Qt, Signal, QTime, QPoint, QThread, QObject, QSettings
 
 from backend import (
     process_video_parallel,
@@ -83,10 +83,19 @@ class VideoPreview(QLabel):
         super().resizeEvent(event)
 
     def mousePressEvent(self, event):
+        settings = QSettings("Emotionalyze", "Emotionalyze")
+
+        last_dir = settings.value("last_video_dir", str(Path.home()))
+
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите видео", "", "Видео (*.mp4 *.avi *.mov)"
+            self,
+            "Выберите видео",
+            last_dir,
+            "Видео (*.mp4 *.avi *.mov)"
         )
+
         if file_path:
+            settings.setValue("last_video_dir", str(Path(file_path).parent))
             self.load_video(Path(file_path))
 
     def dragEnterEvent(self, event):
@@ -391,18 +400,36 @@ class MainWindow(QMainWindow):
         self.analyze_btn.setEnabled(True)
 
     def on_download(self):
-        # формируем имя по шаблону EM_<stem>.json
+        settings = QSettings("Emotionalyze", "Emotionalyze")
+
+        # Получаем последнюю директорию сохранения
+        last_dir = settings.value("last_save_dir", str(Path.home()))
+
+        # Формируем имя файла
         default_name = f"EM_{self._video_path.stem}.json" if self._video_path else "emotion_map.json"
+
+        # Формируем полный путь
+        default_path = str(Path(last_dir) / default_name)
 
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить карту",
-            default_name,
+            default_path,
             "JSON (*.json)"
         )
+
         if save_path:
-            save_emotion_map(self._emotion_map, self._last_percentages, Path(save_path),
-                             self._fps, self._emotion_probs)
+            save_emotion_map(
+                self._emotion_map,
+                self._last_percentages,
+                Path(save_path),
+                self._fps,
+                self._emotion_probs
+            )
+
+            # Запоминаем директорию сохранения
+            settings.setValue("last_save_dir", str(Path(save_path).parent))
+
             self.log_msg(f"Карта сохранена: {Path(save_path).name}")
         else:
             self.log_msg("Сохранение отменено.")
