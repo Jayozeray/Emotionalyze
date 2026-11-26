@@ -2,6 +2,7 @@
 
 import csv
 import math
+import os
 import sys
 import time as _pytime
 from dataclasses import dataclass
@@ -169,6 +170,30 @@ class MainWindow(QMainWindow):
         self.preview = VideoPreview()
         self.preview.setFixedHeight(200)
         v_layout.addWidget(self.preview)
+
+        # Количество процессов анализа: отдельная сохраняемая настройка.
+        self._settings = QSettings("Emotionalyze", "Emotionalyze")
+        max_workers = min(8, os.cpu_count() or 1)
+        default_workers = min(6, max_workers)
+        try:
+            saved_workers = self._settings.value(
+                "analysis_workers", default_workers, type=int
+            )
+        except (TypeError, ValueError):
+            saved_workers = default_workers
+        workers_row = QHBoxLayout()
+        workers_row.addWidget(QLabel("Количество процессов:"))
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(1, max_workers)
+        self.workers_spin.setValue(max(1, min(max_workers, saved_workers)))
+        self.workers_spin.setToolTip(
+            "Каждый процесс загружает свою модель DeepFace. "
+            "При нехватке оперативной памяти уменьшите количество процессов."
+        )
+        workers_row.addWidget(self.workers_spin)
+        v_layout.addLayout(workers_row)
+        self.workers_spin.valueChanged.connect(self._save_worker_count)
+
         self.analyze_btn = QPushButton("Проанализировать видео")
         self.analyze_btn.setEnabled(False)
         v_layout.addWidget(self.analyze_btn)
@@ -356,18 +381,25 @@ class MainWindow(QMainWindow):
         else:
             self.log_msg("Видео удалено")
 
+    @Slot(int)
+    def _save_worker_count(self, count: int):
+        self._settings.setValue("analysis_workers", count)
+        self._settings.sync()
+
     def on_analyze(self):
         if self.thread is not None or self._video_path is None or self._closing:
             return
 
         self._reset_video_result()
         self._analysis_start = _pytime.time()
-        self.thread = VideoAnalysisWorker(self._video_path, workers=2, parent=self)
+        workers = self.workers_spin.value()
+        self.thread = VideoAnalysisWorker(self._video_path, workers=workers, parent=self)
         self.thread.finished.connect(self._on_analysis_stopped)
 
         self.analyze_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
-        self.log_msg("Старт анализа видео…")
+        self.workers_spin.setEnabled(False)
+        self.log_msg(f"Старт анализа видео… (запрошено процессов: {workers})")
         self.thread.start()
 
     def on_cancel_analysis(self):
@@ -406,6 +438,7 @@ class MainWindow(QMainWindow):
             elif result is not None:
                 self._on_analysis_done(*result)
         finally:
+            self.workers_spin.setEnabled(not self._closing)
             self.analyze_btn.setEnabled(
                 self._video_path is not None and not self._closing
             )
