@@ -1,11 +1,13 @@
 # main.py
 
-from gui import run_app
+import multiprocessing
+
 
 def main():
+    from gui import run_app
     run_app()
 
+
 if __name__ == "__main__":
-    import multiprocessing
     multiprocessing.freeze_support()
     main()

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
+from threading import Event
 from typing import List, Tuple, Optional, Dict
 
 from PySide6.QtWidgets import (
@@ -17,10 +18,11 @@ from PySide6.QtWidgets import (
     QMenu, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QGridLayout
 )
 from PySide6.QtGui import QPixmap, QImage, QColor, QBrush
-from PySide6.QtCore import Qt, Signal, QTime, QPoint, QThread, QObject, QSettings
+from PySide6.QtCore import Qt, Signal, QTime, QPoint, QThread, QSettings, QTimer, Slot
 
 from backend import (
     process_video_parallel,
+    AnalysisCancelled,
     save_emotion_map,
     load_emotion_map_ext,
 )
@@ -42,26 +44,32 @@ class LoadedMap:
     probs: Optional[List[List[float]]] = None
 
 
-class VideoAnalysisWorker(QObject):
-    started = Signal()
-    finished = Signal(int, dict, list, object)  # fps, percentages, emotion_map, probs
-    error = Signal(str)
+class VideoAnalysisWorker(QThread):
+    """Поток координирует пул процессов; результат читается после finished."""
 
-    def __init__(self, video_path, workers=None):
-        super().__init__()
+    def __init__(self, video_path, workers=2, parent=None):
+        super().__init__(parent)
         self.video_path = video_path
         self.workers = workers
+        self.cancel_event = Event()
+        self.result = None
+        self.error_message = None
+
+    def cancel(self):
+        # Потокобезопасный сигнал, не зависящий от цикла событий QThread.
+        self.cancel_event.set()
 
     def run(self):
-        self.started.emit()
         try:
-            fps, percentages, emap, probs = process_video_parallel(
+            self.result = process_video_parallel(
                 self.video_path,
-                workers=self.workers
+                workers=self.workers,
+                cancel_event=self.cancel_event
             )
-            self.finished.emit(fps, percentages, emap, probs)
+        except AnalysisCancelled:
+            self.cancel_event.set()
         except Exception as e:
-            self.error.emit(str(e))
+            self.error_message = str(e)
 
 
 class VideoPreview(QLabel):
@@ -138,9 +146,9 @@ class VideoPreview(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.worker = None
         self.thread = None
         self._analysis_start = None
+        self._closing = False
         self.setWindowTitle("Emotionalyze")
         self.resize(1100, 700)
 
@@ -164,6 +172,9 @@ class MainWindow(QMainWindow):
         self.analyze_btn = QPushButton("Проанализировать видео")
         self.analyze_btn.setEnabled(False)
         v_layout.addWidget(self.analyze_btn)
+        self.cancel_btn = QPushButton("Отменить анализ")
+        self.cancel_btn.setEnabled(False)
+        v_layout.addWidget(self.cancel_btn)
 
         # --- Загрузка JSON-карт ---
         maps_box = QGroupBox("Загруженные эталонные карты")
@@ -303,6 +314,7 @@ class MainWindow(QMainWindow):
         # --- Связи сигналов ---
         self.preview.video_changed.connect(self.on_video_changed)
         self.analyze_btn.clicked.connect(self.on_analyze)
+        self.cancel_btn.clicked.connect(self.on_cancel_analysis)
         self.download_btn.clicked.connect(self.on_download)
         self.load_maps_btn.clicked.connect(self.on_load_maps)
         self.clear_maps_btn.clicked.connect(self.on_clear_maps)
@@ -320,46 +332,93 @@ class MainWindow(QMainWindow):
     # Видео
     # ------------------------------------------------------------------
 
+    def _reset_video_result(self):
+        self._emotion_map = None
+        self._emotion_probs = None
+        self._last_percentages = {}
+        self._fps = 0
+        self.download_btn.setEnabled(False)
+        self.update_compare_btn()
+
     def on_video_changed(self, path: Optional[Path]):
+        if self.thread is not None:
+            self.on_cancel_analysis()
+
         self._video_path = path
         self._test_map_index = None
         self.clear_test_highlight()
-        ok = bool(path)
-        self.analyze_btn.setEnabled(ok)
-        if ok:
-            self.download_btn.setEnabled(False)
-            self._emotion_map = None
-            self._emotion_probs = None
+        self._reset_video_result()
+        self.analyze_btn.setEnabled(
+            bool(path) and self.thread is None and not self._closing
+        )
+        if path:
             self.log_msg(f"Видео загружено: {path.name}")
         else:
             self.log_msg("Видео удалено")
-            self.compare_btn.setEnabled(False)
 
     def on_analyze(self):
-        # старт таймера
-        self._analysis_start = _pytime.time()
-        # создаём QThread + worker
-        self.thread = QThread(self)
-        self.worker = VideoAnalysisWorker(self._video_path, workers=None)
-        self.worker.moveToThread(self.thread)
+        if self.thread is not None or self._video_path is None or self._closing:
+            return
 
-        # сигналы
-        self.worker.started.connect(lambda: self.log_msg("Старт анализа видео…"))
-        self.worker.finished.connect(self._on_analysis_done)
-        self.worker.error.connect(self._on_analysis_error)
-        self.thread.started.connect(self.worker.run)
+        self._reset_video_result()
+        self._analysis_start = _pytime.time()
+        self.thread = VideoAnalysisWorker(self._video_path, workers=2, parent=self)
+        self.thread.finished.connect(self._on_analysis_stopped)
 
         self.analyze_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.log_msg("Старт анализа видео…")
         self.thread.start()
 
-    def _on_analysis_error(self, msg: str):
-        self.log_msg("Ошибка: " + msg)
-        if self.thread is not None:
-            self.thread.quit()
-            self.thread.wait()
-        self.worker = None
+    def on_cancel_analysis(self):
+        if self.thread is None:
+            return
+        if not self.thread.cancel_event.is_set():
+            self.thread.cancel()
+            self.log_msg("Отмена анализа: ожидаем завершения процессов…")
+        self.cancel_btn.setEnabled(False)
+        self.analyze_btn.setEnabled(False)
+        self._reset_video_result()
+
+    @Slot()
+    def _on_analysis_stopped(self):
+        thread = self.thread
+        if thread is None:
+            return
+        # finished приходит после выхода из process_video_parallel, включая
+        # shutdown пула процессов. Дожидаемся и завершения самого QThread.
+        thread.wait()
+        cancelled = thread.cancel_event.is_set() or self._closing
+        result = thread.result
+        error = thread.error_message
         self.thread = None
-        self.analyze_btn.setEnabled(self._video_path is not None)
+        thread.result = None
+        thread.deleteLater()
+        self.cancel_btn.setEnabled(False)
+
+        try:
+            if cancelled:
+                self._reset_video_result()
+                self.log_msg("Анализ отменён. Процессы завершены.")
+            elif error is not None:
+                self._reset_video_result()
+                self.log_msg("Ошибка: " + error)
+            elif result is not None:
+                self._on_analysis_done(*result)
+        finally:
+            self.analyze_btn.setEnabled(
+                self._video_path is not None and not self._closing
+            )
+            if self._closing:
+                QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event):
+        if self.thread is not None:
+            self._closing = True
+            self.on_cancel_analysis()
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _print_emotion_stats(self, percentages: Dict[str, float]):
         self.log_msg("Распределение эмоций (%):")
@@ -392,14 +451,10 @@ class MainWindow(QMainWindow):
         self.download_btn.setEnabled(True)
         self.update_compare_btn()
 
-        # остановка потока
-        self.thread.quit()
-        self.thread.wait()
-        self.worker = None
-        self.thread = None
-        self.analyze_btn.setEnabled(True)
-
     def on_download(self):
+        if self._emotion_map is None:
+            return
+
         settings = QSettings("Emotionalyze", "Emotionalyze")
 
         # Получаем последнюю директорию сохранения
