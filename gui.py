@@ -173,7 +173,7 @@ class MainWindow(QMainWindow):
 
         # Количество процессов анализа: отдельная сохраняемая настройка.
         self._settings = QSettings("Emotionalyze", "Emotionalyze")
-        max_workers = min(8, os.cpu_count() or 1)
+        max_workers = min(61, os.cpu_count() or 1)
         default_workers = min(6, max_workers)
         try:
             saved_workers = self._settings.value(
